@@ -184,6 +184,49 @@ jobs:
           echo "deb=${DEB}" >> "${GITHUB_OUTPUT}"
           echo "name=$(basename "${DEB}")" >> "${GITHUB_OUTPUT}"
 
+      # nfpm ships LICENSE-MIT/LICENSE-APACHE/README under /usr/share/doc/wordcraft but
+      # no machine-readable Debian `copyright`, which lintian flags as an error. Add it
+      # and repack. Only the licence files are copied out of the repo — never docs/brand,
+      # which NOTICE explicitly marks as non-open-source.
+      - name: Add Debian copyright file and repack
+        run: |
+          set -euo pipefail
+          DEB="${{ steps.deb.outputs.deb }}"
+          NAME="$(basename "${DEB}")"
+          ROOT="/tmp/deb-repack"
+          rm -rf "${ROOT}"
+          dpkg-deb -R "${DEB}" "${ROOT}"
+          DOC="${ROOT}/usr/share/doc/wordcraft"
+          mkdir -p "${DOC}"
+          install -m644 LICENSE-MIT "${DOC}/LICENSE-MIT"
+          install -m644 LICENSE-APACHE "${DOC}/LICENSE-APACHE"
+          if [ -f NOTICE ]; then install -m644 NOTICE "${DOC}/NOTICE"; fi
+          printf '%s\n' \
+            'Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/' \
+            'Upstream-Name: wordcraft' \
+            'Upstream-Contact: https://github.com/storytold/wordcraft/issues' \
+            'Source: https://github.com/storytold/wordcraft' \
+            '' \
+            'Files: *' \
+            'Copyright: 2026 ArtCraft Team and the WordCraft contributors' \
+            'License: MIT or Apache-2.0' \
+            ' The bundled fonts (Inter, JetBrains Mono, Source Sans 3, Source Serif 4)' \
+            ' are under the SIL Open Font License 1.1; see the OFL files shipped with' \
+            ' the assets and ATTRIBUTION.md in the source tree.' \
+            '' \
+            'Files: usr/share/doc/wordcraft/*' \
+            'Copyright: 2026 ArtCraft Team and the WordCraft contributors' \
+            'License: MIT or Apache-2.0' \
+            > "${DOC}/copyright"
+          chmod 0644 "${DOC}/copyright"
+          find "${ROOT}" -type d -exec chmod 0755 {} +
+          REBUILT="/tmp/${NAME}"
+          rm -f "${REBUILT}"
+          dpkg-deb --build --root-owner-group "${ROOT}" "${REBUILT}"
+          mv -f "${REBUILT}" "${DEB}"
+          dpkg-deb --info "${DEB}"
+          ls -lh "${DEB}"
+
       # ── Guard 2: the real guarantee — no symbol above MAX_GLIBC ──
       - name: Assert max glibc symbol <= ${{ env.MAX_GLIBC }}
         run: |
@@ -221,7 +264,10 @@ jobs:
           DEB="${{ steps.deb.outputs.deb }}"
           # Only tags that exist in bookworm's lintian 2.115 — an unknown --suppress-tags
           # value makes lintian exit 25 before it ever looks at the package.
-          SUPPRESS="changelog-file-missing-in-native-package no-changelog no-manual-page"
+          # `maintainer-script-ignores-errors` is intentional upstream: postinst.sh
+          # wraps every cache refresh in `|| true` so a container or minimal system
+          # without desktop-file-utils still installs cleanly.
+          SUPPRESS="changelog-file-missing-in-native-package no-changelog no-manual-page maintainer-script-ignores-errors"
           ARGS=()
           for t in ${SUPPRESS}; do ARGS+=(--suppress-tags "${t}"); done
           set +e
