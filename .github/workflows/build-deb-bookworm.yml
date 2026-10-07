@@ -188,7 +188,7 @@ jobs:
       - name: Assert max glibc symbol <= ${{ env.MAX_GLIBC }}
         run: |
           set -euo pipefail
-          for BIN in target/release/wordcraft target/release/wordcraft-cli; do
+          for BIN in "${CARGO_TARGET_DIR}/release/wordcraft" "${CARGO_TARGET_DIR}/release/wordcraft-cli"; do
             if [ ! -f "${BIN}" ]; then
               echo "::error::missing ${BIN}"
               exit 1
