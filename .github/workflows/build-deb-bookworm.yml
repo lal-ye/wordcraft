@@ -1,0 +1,310 @@
+name: Build WordCraft .deb for Debian bookworm
+
+# Upstream's own packaging (packaging/linux/nfpm.yaml + package.sh) already targets
+# glibc >= 2.35 (they build on ubuntu-22.04), so this workflow's only real job is to
+# rebuild the deb inside a Debian 12 container so it is guaranteed link-compatible with
+# bookworm, and to smoke-test the result before shipping it.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege. contents:write is only needed by the release-attach step.
+permissions:
+  contents: write
+
+# A full build is ~15 min; never let two runs of the same ref race.
+concurrency:
+  group: bookworm-deb-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Highest glibc the resulting binaries may require (Debian 12 ships 2.36).
+  MAX_GLIBC: "2.36"
+  NFPM_VERSION: 2.47.0
+  NFPM_AMD64_SHA256: 3f1cf344bd0b57373ca55636a78c08b0491f7293d609a456a9ac3b0b150fda97
+  CARGO_HOME: /github/home/.cargo
+  RUSTUP_HOME: /github/home/.rustup
+  CARGO_TARGET_DIR: /tmp/cargo-target
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # Fixed epoch so repeated builds produce identical timestamps.
+  SOURCE_DATE_EPOCH: "1704067200"
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    # ubuntu-latest is glibc 2.39, so the container is what pins the ABI.
+    container:
+      image: debian:bookworm@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858
+      options: --user root
+
+    # Container jobs otherwise default to `sh -e` (dash), which has no `pipefail`.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # ── Guard 1: the container itself must not be newer than MAX_GLIBC ──
+      - name: Assert container glibc <= ${{ env.MAX_GLIBC }}
+        run: |
+          set -euo pipefail
+          GLIBC_VER="$(ldd --version 2>&1 | awk 'match($0, /[0-9]+\.[0-9]+/) { print substr($0, RSTART, RLENGTH); exit }')"
+          echo "Container glibc: ${GLIBC_VER}"
+          HIGHEST="$(printf '%s\n%s\n' "${GLIBC_VER}" "${{ env.MAX_GLIBC }}" | sort -V | tail -1)"
+          if [ "${HIGHEST}" != "${{ env.MAX_GLIBC }}" ]; then
+            echo "::error::Container glibc ${GLIBC_VER} is newer than the allowed ${{ env.MAX_GLIBC }}"
+            exit 1
+          fi
+          echo "glibc ${GLIBC_VER} is acceptable"
+
+      - name: Install build and packaging tools
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          # Same list as upstream's release.yml linux job, plus the lintian/smoke-test
+          # tooling and a software GL stack so the headless launch can find a renderer.
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config binutils file \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            desktop-file-utils appstream python3-yaml \
+            dpkg-dev lintian xvfb \
+            libgl1-mesa-dri mesa-vulkan-drivers libegl1 libvulkan1 libxkbcommon0
+          # apt lists are deliberately kept: the smoke test needs `apt-get install -f`.
+          ldd --version | awk 'NR==1'
+
+      - name: Install nfpm (checksum-pinned)
+        run: |
+          set -euo pipefail
+          DEB="nfpm_${NFPM_VERSION}_amd64.deb"
+          URL="https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/${DEB}"
+          curl -fsSL --retry 3 --retry-all-errors -o "/tmp/${DEB}" "${URL}"
+          ACTUAL="$(sha256sum "/tmp/${DEB}" | cut -d' ' -f1)"
+          echo "nfpm sha256: ${ACTUAL}"
+          if [ "${ACTUAL}" != "${NFPM_AMD64_SHA256}" ]; then
+            echo "::error::nfpm checksum mismatch: expected ${NFPM_AMD64_SHA256}, got ${ACTUAL}"
+            exit 1
+          fi
+          dpkg -i "/tmp/${DEB}"
+          nfpm --version
+
+      # ── rustup, then the toolchain ──
+      # rustup refuses to lay down shims when $HOME (/github/home) differs from the
+      # euid home (/root), so pin both homes explicitly and symlink into /usr/local/bin.
+      - name: Install rustup
+        run: |
+          set -euo pipefail
+          export CARGO_HOME RUSTUP_HOME
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+          RUSTUP_BIN=""
+          for d in "${CARGO_HOME}/bin" /root/.cargo/bin /usr/local/cargo/bin; do
+            if [ -x "${d}/rustup" ]; then RUSTUP_BIN="${d}/rustup"; break; fi
+          done
+          if [ -z "${RUSTUP_BIN}" ]; then
+            echo "::error::could not locate an installed rustup binary"
+            ls -la "${CARGO_HOME}/bin" 2>/dev/null || true
+            ls -la /root/.cargo/bin 2>/dev/null || true
+            exit 1
+          fi
+          echo "rustup found at ${RUSTUP_BIN}"
+          for b in rustup cargo rustc; do
+            ln -sf "${RUSTUP_BIN%/rustup}/${b}" "/usr/local/bin/${b}"
+          done
+          command -v rustup
+          command -v cargo
+
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Upstream pins no rust-toolchain.toml; their CI uses dtolnay/rust-toolchain@stable.
+      # We mirror that (Rust >= 1.90 per [workspace.package] rust-version) but record the
+      # exact version so a rebuild is traceable.
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          export CARGO_HOME RUSTUP_HOME
+          export PATH="/usr/local/bin:${PATH}"
+          if [ -f rust-toolchain.toml ]; then
+            echo "repo pins a toolchain:"; cat rust-toolchain.toml
+          else
+            echo "no rust-toolchain.toml in repo; using stable (upstream's CI does the same)"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+          {
+            echo "### Rust $(rustc --version)"
+            echo "- commit \`${GITHUB_SHA::9}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ". -> /tmp/cargo-target"
+          shared-key: bookworm-release
+
+      # ── Upstream's own packaging: cargo build + stage + nfpm ──
+      - name: Build and package the .deb
+        env:
+          WORDCRAFT_BUILD_SHA: ${{ github.sha }}
+          # WORDCRAFT_BUILD_DATE is deliberately unset: packaging/env.sh defaults it to
+          # `date -u +%Y-%m-%d`, the format the metainfo template expects.
+        run: |
+          set -euo pipefail
+          export CARGO_HOME RUSTUP_HOME CARGO_TARGET_DIR CARGO_INCREMENTAL RUST_BACKTRACE
+          export PATH="/usr/local/bin:${PATH}"
+          # deb only: skips the AppImage, which would download appimagetool for nothing.
+          packaging/linux/package.sh --formats deb
+          ls -lh dist/release/
+
+      - name: Locate the .deb
+        id: deb
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          DEBS=(dist/release/*.deb)
+          if [ ${#DEBS[@]} -ne 1 ]; then
+            echo "::error::expected exactly one .deb, found ${#DEBS[@]}"
+            ls -la dist/release/ || true
+            exit 1
+          fi
+          DEB="${DEBS[0]}"
+          echo "deb=${DEB}"
+          echo "name=$(basename "${DEB}")"
+          ls -lh "${DEB}"
+          echo "deb=${DEB}" >> "${GITHUB_OUTPUT}"
+          echo "name=$(basename "${DEB}")" >> "${GITHUB_OUTPUT}"
+
+      # ── Guard 2: the real guarantee — no symbol above MAX_GLIBC ──
+      - name: Assert max glibc symbol <= ${{ env.MAX_GLIBC }}
+        run: |
+          set -euo pipefail
+          for BIN in target/release/wordcraft target/release/wordcraft-cli; do
+            if [ ! -f "${BIN}" ]; then
+              echo "::error::missing ${BIN}"
+              exit 1
+            fi
+            MAX_SYM="$(objdump -T "${BIN}" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)"
+            if [ -z "${MAX_SYM}" ]; then
+              echo "::error::could not read dynamic symbols from ${BIN}; refusing to ship unverified"
+              exit 1
+            fi
+            HIGHEST="$(printf '%s\n%s\n' "${MAX_SYM}" "${{ env.MAX_GLIBC }}" | sort -V | tail -1)"
+            if [ "${HIGHEST}" != "${{ env.MAX_GLIBC }}" ]; then
+              echo "::error::${BIN} requires GLIBC_${MAX_SYM}, above the allowed GLIBC_${{ env.MAX_GLIBC }}"
+              objdump -T "${BIN}" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V -u
+              exit 1
+            fi
+            echo "${BIN}: max GLIBC ${MAX_SYM} (OK)"
+          done
+
+      - name: Inspect the package
+        run: |
+          set -euo pipefail
+          DEB="${{ steps.deb.outputs.deb }}"
+          dpkg-deb --info "${DEB}"
+          echo "--- contents ---"
+          dpkg-deb --contents "${DEB}"
+
+      - name: Lintian
+        run: |
+          set -euo pipefail
+          DEB="${{ steps.deb.outputs.deb }}"
+          # Only tags that exist in bookworm's lintian 2.115 — an unknown --suppress-tags
+          # value makes lintian exit 25 before it ever looks at the package.
+          SUPPRESS="changelog-file-missing-in-native-package no-changelog no-manual-page"
+          ARGS=()
+          for t in ${SUPPRESS}; do ARGS+=(--suppress-tags "${t}"); done
+          set +e
+          OUTPUT="$(lintian "${ARGS[@]}" "${DEB}" 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "${OUTPUT}"
+          if printf '%s' "${OUTPUT}" | grep -q 'Unknown tag'; then
+            echo "::error::this lintian does not know one of: ${SUPPRESS}"
+            exit 1
+          fi
+          if [ ${rc} -eq 0 ]; then
+            echo "lintian clean"
+          elif [ ${rc} -eq 1 ]; then
+            echo "::warning::lintian reported warnings (non-fatal)"
+          else
+            echo "::error::lintian failed with ${rc}"
+            exit ${rc}
+          fi
+
+      # The point of this test is the loader and the maintainer scripts, not the GUI:
+      # `dpkg -i` must reach state `ii`, `ldd` must resolve everything, and the CLI must
+      # print its version. A real GUI needs a GPU, which a container does not have, so
+      # that launch is logged, and only a loader failure (127) is treated as fatal.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          DEB="${{ steps.deb.outputs.deb }}"
+          dpkg -i "${DEB}" || apt-get install -f -y --no-install-recommends
+
+          STATUS="$(dpkg-query -W -f='${db:Status-Abbrev}' wordcraft 2>/dev/null | cut -c1-2)"
+          if [ "${STATUS}" != "ii" ]; then
+            echo "::error::package state '${STATUS}', expected 'ii'"
+            dpkg -l wordcraft || true
+            exit 1
+          fi
+          echo "install OK (ii)"
+
+          MISSING="$(ldd /usr/bin/wordcraft | grep -c 'not found' || true)"
+          if [ "${MISSING}" -ne 0 ]; then
+            echo "::error::${MISSING} unresolved shared libraries on /usr/bin/wordcraft"
+            ldd /usr/bin/wordcraft
+            exit 1
+          fi
+          ldd /usr/bin/wordcraft
+
+          if ! wordcraft-cli --version; then
+            echo "::error::wordcraft-cli --version failed; the loader rejected the build"
+            exit 1
+          fi
+
+          set +e
+          GUI_OUT="$(timeout 25 xvfb-run --auto-servernum --server-args="-screen 0 1280x900x24" \
+            wordcraft 2>&1)"
+          GUI_RC=$?
+          set -e
+          echo "--- GUI launch (exit ${GUI_RC}) ---"
+          printf '%s\n' "${GUI_OUT}"
+          if [ "${GUI_RC}" -eq 127 ]; then
+            echo "::error::wordcraft could not start: dynamic loader failure"
+            exit 1
+          fi
+          echo "GUI outcome recorded; not a pass/fail gate (no GPU in a container)"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.deb.outputs.name }}
+          path: ${{ steps.deb.outputs.deb }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach .deb to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          DEB="${{ steps.deb.outputs.deb }}"
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \
+            || gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+                 --title "WordCraft ${TAG#v} for Debian bookworm" \
+                 --notes "Built from source in a bookworm container (glibc 2.36)."
+          gh release upload "${TAG}" "${DEB}" --repo "${GITHUB_REPOSITORY}" --clobber
